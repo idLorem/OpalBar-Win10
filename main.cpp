@@ -29,7 +29,7 @@ using SetWcaFn = BOOL(WINAPI*)(HWND, WcaData*);
 using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
 
 constexpr wchar_t kName[] = L"OpalBar";
-constexpr wchar_t kVersion[] = L"0.2.0";
+constexpr wchar_t kVersion[] = L"0.2.1";
 constexpr wchar_t kTrayClass[] = L"OpalBar10Tray";
 constexpr wchar_t kSettingsClass[] = L"OpalBar10Settings";
 constexpr wchar_t kMutex[] = L"OpalBar10.single";
