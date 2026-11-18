@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.20)
+project(OpalBarWin10 CXX)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /EHsc /permissive- /utf-8")
+add_compile_definitions(UNICODE _UNICODE)
+add_executable(OpalBar10 main.cpp)
