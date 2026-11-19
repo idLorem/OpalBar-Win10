@@ -8,7 +8,12 @@ namespace Gdiplus { using std::min; using std::max; }
 #include <gdiplus.h>
 #include <shellapi.h>
 #include <shlwapi.h>
+#include <urlmon.h>
+#include <wininet.h>
 #include <cmath>
+#include <fstream>
+#include <iterator>
+#include <thread>
 #include <cstdio>
 #include <cstdarg>
 #include <cwchar>
@@ -21,6 +26,8 @@ namespace Gdiplus { using std::min; using std::max; }
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "urlmon.lib")
+#pragma comment(lib, "wininet.lib")
 using namespace Gdiplus;
 
 struct Accent { int state; int flags; unsigned color; int anim; };
@@ -29,13 +36,15 @@ using SetWcaFn = BOOL(WINAPI*)(HWND, WcaData*);
 using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
 
 constexpr wchar_t kName[] = L"OpalBar";
-constexpr wchar_t kVersion[] = L"0.3.0";
+constexpr wchar_t kVersion[] = L"0.4.0";
 constexpr wchar_t kTrayClass[] = L"OpalBar10Tray";
 constexpr wchar_t kSettingsClass[] = L"OpalBar10Settings";
 constexpr wchar_t kMutex[] = L"OpalBar10.single";
 constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 constexpr wchar_t kRunName[] = L"OpalBar10";
-constexpr UINT kTrayMsg = WM_APP + 1, kOpenMsg = WM_APP + 2;
+constexpr UINT kTrayMsg = WM_APP + 1, kOpenMsg = WM_APP + 2, kUpdateMsg = WM_APP + 3, kUpdateReadyMsg = WM_APP + 4;
+constexpr wchar_t kRepo[] = L"idLorem/OpalBar-Win10";
+constexpr wchar_t kAsset[] = L"OpalBar10.exe";
 constexpr UINT_PTR kReapply = 1, kSave = 1, kPaint = 2;
 constexpr UINT kCmdSettings = 1, kCmdEnabled = 2, kCmdHide = 3, kCmdExit = 4;
 constexpr float kWinW = 560, kWinH = 444;
@@ -49,7 +58,7 @@ struct Item {
     double min, max, step, def;
     double v = 0; RectF box{}; bool enabled = true;
 };
-enum { iEnabled, iClear, iBlur, iAcrylic, iColorMode, iSolid, iTint, iDensity, iAutostart, iTray, iMaxSolid, iAllMon, iLang, iReset, iCount };
+enum { iEnabled, iClear, iBlur, iAcrylic, iColorMode, iSolid, iTint, iDensity, iAutostart, iTray, iMaxSolid, iAllMon, iLang, iReset, iUpdate, iCount };
 
 static std::vector<Item> g_items = {
     { kToggle, L"Enabled", 0, 1, 1, 1 },
@@ -66,6 +75,7 @@ static std::vector<Item> g_items = {
     { kToggle, L"All monitors", 0, 1, 1, 1 },
     { kButton, L"Русский", 0, 0, 0, 0 },
     { kButton, L"Reset", 0, 0, 0, 0 },
+    { kButton, L"Check for updates", 0, 0, 0, 0 },
 };
 
 static const wchar_t* kRu[][2] = {
@@ -77,6 +87,12 @@ static const wchar_t* kRu[][2] = {
     { L"Reset", L"Сброс" }, { L"OpalBar Settings", L"Настройки OpalBar" },
     { L"Solid", L"Сплошной" }, { L"Solid when a window is maximized", L"Сплошной при развёрнутом окне" },
     { L"All monitors", L"Все мониторы" },
+    { L"Check for updates", L"Проверить обновления" }, { L"Checking…", L"Проверяю…" },
+    { L"You have the latest version", L"Установлена последняя версия" },
+    { L"Install update ", L"Установить обновление " }, { L"Downloading…", L"Скачиваю…" },
+    { L"Could not check for updates", L"Не удалось проверить обновления" },
+    { L"Could not download the update", L"Не удалось скачать обновление" },
+    { L"Could not install the update", L"Не удалось установить обновление" },
 };
 
 FILE* g_log;
@@ -110,6 +126,7 @@ void Log(const char* fmt, ...) {
 
 double& V(int i) { return g_items[i].v; }
 float S(float dip) { return dip * g_s; }
+std::wstring UpdateLabel();
 
 BOOL CALLBACK CollectTaskbars(HWND h, LPARAM lp) {
     wchar_t cls[64];
@@ -331,6 +348,7 @@ void Layout() {
     box(iAllMon, x + t3 + 32, 328, t4, 40);
     box(iLang, x, 376, 120, 32);
     box(iReset, x + 128, 376, 120, 32);
+    box(iUpdate, x + w - 216, 376, 216, 32);
     g_items[iTint].enabled = g_mode != 0;
     g_items[iDensity].enabled = g_mode != 0 && g_mode != 4;
 }
@@ -372,7 +390,8 @@ void DrawItem(Graphics& g, int i) {
         bool sel = it.kind == kTile && i - iClear == g_mode;
         FillRound(g, it.box, S(8), White(sel ? 0x50 : hot ? kTileHot : kTile_));
         StrokeRound(g, it.box, S(8), White(sel ? 0xB0 : kEdge), S(1));
-        Text(g, i == iLang ? (g_ru ? L"English" : L"Русский") : Tr(it.label), it.box, 13, kText, sel ? kSemibold : kRegular, StringAlignmentCenter);
+        std::wstring label = i == iLang ? (g_ru ? L"English" : L"Русский") : i == iUpdate ? UpdateLabel() : Tr(it.label);
+        Text(g, label, it.box, 13, kText, sel ? kSemibold : kRegular, StringAlignmentCenter);
     }
 }
 
@@ -429,6 +448,121 @@ void SetMode(int m) {
     else Persist();
 }
 
+struct Update { bool ok = false; std::wstring version, url; };
+const wchar_t* g_updKey = L"Check for updates";
+std::wstring g_updVer, g_updUrl;
+bool g_updBusy;
+HANDLE g_once;
+
+std::wstring UpdateLabel() { return Tr(g_updKey) + g_updVer; }
+
+void SetUpdate(HWND w, const wchar_t* key, const std::wstring& ver = L"") {
+    g_updKey = key;
+    g_updVer = ver;
+    InvalidateRect(w, nullptr, FALSE);
+}
+
+bool Newer(const std::wstring& a, const std::wstring& b) {
+    auto next = [](const wchar_t*& p) {
+        while (*p && !iswdigit(*p)) p++;
+        wchar_t* e; unsigned long n = wcstoul(p, &e, 10); p = e;
+        return n;
+    };
+    const wchar_t *pa = a.c_str(), *pb = b.c_str();
+    while (*pa || *pb) {
+        auto x = next(pa), y = next(pb);
+        if (x != y) return x > y;
+    }
+    return false;
+}
+
+std::vector<std::wstring> JsonStrings(const std::string& json, const char* key) {
+    std::vector<std::wstring> out;
+    const auto npos = std::string::npos;
+    std::string k = "\"" + std::string(key) + "\"";
+    for (auto at = json.find(k); at != npos; at = json.find(k, at + 1)) {
+        auto c = json.find(':', at + k.size());
+        auto a = c == npos ? npos : json.find('"', c);
+        auto e = a == npos ? npos : json.find('"', a + 1);
+        if (e == npos) break;
+        out.emplace_back(json.begin() + a + 1, json.begin() + e);
+    }
+    return out;
+}
+
+Update ParseRelease(const std::string& json) {
+    Update u;
+    auto tags = JsonStrings(json, "tag_name");
+    if (tags.empty()) return u;
+    u.ok = true;
+    u.version = tags[0];
+    std::wstring prefix = std::wstring(L"https://github.com/") + kRepo + L"/releases/download/", suffix = std::wstring(L"/") + kAsset;
+    for (auto& url : JsonStrings(json, "browser_download_url"))
+        if (url.rfind(prefix, 0) == 0 && url.size() > suffix.size() && !url.compare(url.size() - suffix.size(), suffix.size(), suffix))
+            u.url = url;
+    return u;
+}
+
+std::wstring ExePath() {
+    wchar_t p[MAX_PATH];
+    GetModuleFileNameW(nullptr, p, MAX_PATH);
+    return p;
+}
+
+bool LooksLikeExe(const std::wstring& path) {
+    std::ifstream f(path, std::ios::binary);
+    char head[2] = {};
+    f.read(head, 2);
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    return f.gcount() == 2 && head[0] == 'M' && head[1] == 'Z' && GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &d) && d.nFileSizeLow > 100000;
+}
+
+void UpdateClick(HWND w) {
+    if (g_updBusy) return;
+    g_updBusy = true;
+    if (!g_updUrl.empty()) {
+        SetUpdate(w, L"Downloading…");
+        std::thread([w, url = g_updUrl, dest = ExePath() + L".new"] {
+            DeleteUrlCacheEntryW(url.c_str());
+            bool ok = URLDownloadToFileW(nullptr, url.c_str(), dest.c_str(), 0, nullptr) == S_OK && LooksLikeExe(dest);
+            if (!ok) DeleteFileW(dest.c_str());
+            PostMessageW(w, kUpdateReadyMsg, ok, 0);
+        }).detach();
+        return;
+    }
+    SetUpdate(w, L"Checking…");
+    std::thread([w] {
+        auto u = new Update;
+        wchar_t tmp[MAX_PATH];
+        GetTempPathW(MAX_PATH, tmp);
+        std::wstring file = std::wstring(tmp) + L"OpalBar10_latest.json";
+        auto api = std::wstring(L"https://api.github.com/repos/") + kRepo + L"/releases/latest";
+        DeleteUrlCacheEntryW(api.c_str());
+        if (URLDownloadToFileW(nullptr, api.c_str(), file.c_str(), 0, nullptr) == S_OK) {
+            std::ifstream f(file, std::ios::binary);
+            *u = ParseRelease(std::string(std::istreambuf_iterator<char>(f), {}));
+        }
+        DeleteFileW(file.c_str());
+        if (!PostMessageW(w, kUpdateMsg, 0, (LPARAM)u)) delete u;
+    }).detach();
+}
+
+bool ApplyUpdate() {
+    std::wstring cur = ExePath(), fresh = cur + L".new", old = cur + L".old";
+    DeleteFileW(old.c_str());
+    if (!MoveFileExW(cur.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING)) return false;
+    if (!MoveFileExW(fresh.c_str(), cur.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        MoveFileExW(old.c_str(), cur.c_str(), MOVEFILE_REPLACE_EXISTING);
+        return false;
+    }
+    Persist();
+    ReleaseMutex(g_once);
+    CloseHandle(g_once);
+    ShellExecuteW(nullptr, nullptr, cur.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    DestroyWindow(g_tray);
+    return true;
+}
+
 void Activate(HWND w, int i) {
     auto& it = g_items[i];
     if (it.kind == kToggle) Change(i, it.v ? 0 : 1);
@@ -446,6 +580,8 @@ void Activate(HWND w, int i) {
         SetWindowTextW(w, Tr(L"OpalBar Settings"));
         SetTimer(w, kSave, 200, nullptr);
         InvalidateRect(w, nullptr, FALSE);
+    } else if (i == iUpdate) {
+        UpdateClick(w);
     } else if (i == iReset) {
         g_mode = kDefMode;
         V(iTint) = kDefTint;
@@ -519,6 +655,20 @@ LRESULT CALLBACK SettingsProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
         KillTimer(w, kSave);
         Persist();
+        return 0;
+    case kUpdateMsg: {
+        std::unique_ptr<Update> u((Update*)lp);
+        g_updBusy = false;
+        if (!u->ok) SetUpdate(w, L"Could not check for updates");
+        else if (!Newer(u->version, kVersion)) SetUpdate(w, L"You have the latest version");
+        else if (u->url.empty()) SetUpdate(w, L"Could not check for updates");
+        else { g_updUrl = u->url; SetUpdate(w, L"Install update ", u->version); }
+        return 0;
+    }
+    case kUpdateReadyMsg:
+        g_updBusy = false;
+        if (!wp) SetUpdate(w, L"Could not download the update");
+        else if (!ApplyUpdate()) SetUpdate(w, L"Could not install the update");
         return 0;
     case WM_DPICHANGED: {
         g_s = HIWORD(wp) / 96.f;
@@ -609,7 +759,7 @@ LRESULT CALLBACK TrayProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
-    HANDLE once = CreateMutexW(nullptr, TRUE, kMutex);
+    g_once = CreateMutexW(nullptr, TRUE, kMutex);
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         if (HWND old = FindWindowW(kTrayClass, nullptr)) PostMessageW(old, kOpenMsg, 0, 0);
         return 0;
@@ -621,6 +771,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     std::wstring dir = path;
     dir.resize(dir.find_last_of(L'\\') + 1);
     g_ini = dir + L"OpalBar10.ini";
+    DeleteFileW((std::wstring(path) + L".old").c_str());
+    DeleteFileW((std::wstring(path) + L".new").c_str());
     g_log = _wfopen((dir + L"OpalBar10.log").c_str(), L"wb");
 
     OSVERSIONINFOW v{sizeof v};
@@ -654,6 +806,5 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     Log("exit");
     g_logo.reset();
     GdiplusShutdown(gdip);
-    CloseHandle(once);
     return 0;
 }
