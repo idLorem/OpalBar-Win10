@@ -29,7 +29,7 @@ using SetWcaFn = BOOL(WINAPI*)(HWND, WcaData*);
 using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
 
 constexpr wchar_t kName[] = L"OpalBar";
-constexpr wchar_t kVersion[] = L"0.2.1";
+constexpr wchar_t kVersion[] = L"0.3.0";
 constexpr wchar_t kTrayClass[] = L"OpalBar10Tray";
 constexpr wchar_t kSettingsClass[] = L"OpalBar10Settings";
 constexpr wchar_t kMutex[] = L"OpalBar10.single";
@@ -38,7 +38,7 @@ constexpr wchar_t kRunName[] = L"OpalBar10";
 constexpr UINT kTrayMsg = WM_APP + 1, kOpenMsg = WM_APP + 2;
 constexpr UINT_PTR kReapply = 1, kSave = 1, kPaint = 2;
 constexpr UINT kCmdSettings = 1, kCmdEnabled = 2, kCmdHide = 3, kCmdExit = 4;
-constexpr float kWinW = 520, kWinH = 400;
+constexpr float kWinW = 560, kWinH = 444;
 constexpr int kDefMode = 1;
 constexpr unsigned kDefTint = 0x202020;
 constexpr double kDefDensity = 0.5;
@@ -49,7 +49,7 @@ struct Item {
     double min, max, step, def;
     double v = 0; RectF box{}; bool enabled = true;
 };
-enum { iEnabled, iClear, iBlur, iAcrylic, iColorMode, iTint, iDensity, iAutostart, iTray, iLang, iReset, iCount };
+enum { iEnabled, iClear, iBlur, iAcrylic, iColorMode, iSolid, iTint, iDensity, iAutostart, iTray, iMaxSolid, iAllMon, iLang, iReset, iCount };
 
 static std::vector<Item> g_items = {
     { kToggle, L"Enabled", 0, 1, 1, 1 },
@@ -57,10 +57,13 @@ static std::vector<Item> g_items = {
     { kTile, L"Blur", 0, 0, 0, 0 },
     { kTile, L"Acrylic", 0, 0, 0, 0 },
     { kTile, L"Color", 0, 0, 0, 0 },
+    { kTile, L"Solid", 0, 0, 0, 0 },
     { kColor, L"Tint color", 0, 0, 0, kDefTint },
     { kSlider, L"Tint density", 0, 1, 0.01, kDefDensity },
     { kToggle, L"Start with Windows", 0, 1, 1, 0 },
     { kToggle, L"Tray icon", 0, 1, 1, 1 },
+    { kToggle, L"Solid when a window is maximized", 0, 1, 1, 0 },
+    { kToggle, L"All monitors", 0, 1, 1, 1 },
     { kButton, L"Русский", 0, 0, 0, 0 },
     { kButton, L"Reset", 0, 0, 0, 0 },
 };
@@ -71,7 +74,9 @@ static const wchar_t* kRu[][2] = {
     { L"Clear", L"Прозрачный" }, { L"Blur", L"Размытие" }, { L"Acrylic", L"Акрил" }, { L"Color", L"Цвет" },
     { L"Tint color", L"Цвет тонировки" }, { L"Tint density", L"Плотность тонировки" },
     { L"Start with Windows", L"Запускать с Windows" }, { L"Tray icon", L"Значок в трее" },
-    { L"Reset", L"Сброс" }, { L"OpalBar Settings", L"Настройки OpalBar" }, { L"Auto", L"Авто" },
+    { L"Reset", L"Сброс" }, { L"OpalBar Settings", L"Настройки OpalBar" },
+    { L"Solid", L"Сплошной" }, { L"Solid when a window is maximized", L"Сплошной при развёрнутом окне" },
+    { L"All monitors", L"Все мониторы" },
 };
 
 FILE* g_log;
@@ -81,7 +86,7 @@ UINT g_taskbarCreated;
 bool g_ru;
 int g_mode = kDefMode;
 int g_state;
-unsigned g_color;
+unsigned g_color, g_solid;
 float g_s = 1;
 int g_hover = -1, g_drag = -1;
 std::wstring g_ini;
@@ -114,6 +119,19 @@ BOOL CALLBACK CollectTaskbars(HWND h, LPARAM lp) {
     return TRUE;
 }
 
+bool Maximized(HWND bar) {
+    struct Ctx { HMONITOR mon; bool found; } c{ MonitorFromWindow(bar, MONITOR_DEFAULTTONEAREST), false };
+    EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+        auto c = reinterpret_cast<Ctx*>(lp);
+        if (!IsWindowVisible(h) || !IsZoomed(h) || IsIconic(h) || (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)) return TRUE;
+        DWORD cloaked = 0;
+        DwmGetWindowAttribute(h, 14, &cloaked, sizeof cloaked);
+        if (!cloaked && MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST) == c->mon) c->found = true;
+        return !c->found;
+    }, reinterpret_cast<LPARAM>(&c));
+    return c.found;
+}
+
 void Push() {
     static size_t lastCount = SIZE_MAX;
     static bool lastFailed = false;
@@ -122,7 +140,15 @@ void Push() {
     if (bars.size() != lastCount) { Log("taskbar windows: %zu", bars.size()); lastCount = bars.size(); }
     bool failed = false;
     for (HWND h : bars) {
-        Accent acc{g_state, 2, g_color, 0};
+        int state = g_state;
+        unsigned color = g_color;
+        if (V(iEnabled)) {
+            wchar_t cls[32];
+            GetClassNameW(h, cls, 32);
+            if (!wcscmp(cls, L"Shell_SecondaryTrayWnd") && !V(iAllMon)) { state = 0; color = 0; }
+            else if (V(iMaxSolid) && Maximized(h)) { state = 1; color = g_solid; }
+        }
+        Accent acc{state, 2, color, 0};
         WcaData d{19, &acc, sizeof acc};
         SetLastError(0);
         if (!g_set(h, &d)) { failed = true; if (!lastFailed) Log("apply failed hwnd=%p err=%lu", (void*)h, GetLastError()); }
@@ -133,11 +159,13 @@ void Push() {
 void Reapply() {
     unsigned c = unsigned(V(iTint));
     unsigned abgr = (unsigned(std::clamp(V(iDensity), 0.0, 1.0) * 255) << 24) | ((c & 255) << 16) | (c & 0xFF00) | (c >> 16 & 255);
+    g_solid = abgr | 0xFF000000;
     if (!V(iEnabled)) { g_state = 0; g_color = 0; }
-    else if (g_mode == 0) { g_state = 2; g_color = 0; }
+    else if (g_mode == 0 || (g_mode <= 2 && !(abgr >> 24))) { g_state = 2; g_color = 0; }
     else if (g_mode == 1) { g_state = 3; g_color = abgr; }
     else if (g_mode == 2) { g_state = 4; g_color = abgr; }
-    else { g_state = 2; g_color = abgr; }
+    else if (g_mode == 3) { g_state = 2; g_color = abgr; }
+    else { g_state = 1; g_solid = g_color = abgr | 0xFF000000; }
     Push();
 }
 
@@ -176,6 +204,8 @@ void Persist() {
     Put(L"Taskbar", L"Mode", std::to_wstring(g_mode));
     Put(L"App", L"Enabled", V(iEnabled) ? L"1" : L"0");
     Put(L"App", L"TrayIcon", V(iTray) ? L"1" : L"0");
+    Put(L"Taskbar", L"SolidWhenMaximized", V(iMaxSolid) ? L"1" : L"0");
+    Put(L"Taskbar", L"AllMonitors", V(iAllMon) ? L"1" : L"0");
     Put(L"App", L"Language", g_ru ? L"ru" : L"en");
 }
 
@@ -186,7 +216,9 @@ void LoadSettings() {
     V(iEnabled) = GetPrivateProfileIntW(L"App", L"Enabled", 1, g_ini.c_str()) != 0;
     V(iTray) = GetPrivateProfileIntW(L"App", L"TrayIcon", 1, g_ini.c_str()) != 0;
     g_mode = GetPrivateProfileIntW(L"Taskbar", L"Mode", kDefMode, g_ini.c_str());
-    if (g_mode < 0 || g_mode > 3) g_mode = kDefMode;
+    if (g_mode < 0 || g_mode > 4) g_mode = kDefMode;
+    V(iMaxSolid) = GetPrivateProfileIntW(L"Taskbar", L"SolidWhenMaximized", 0, g_ini.c_str()) != 0;
+    V(iAllMon) = GetPrivateProfileIntW(L"Taskbar", L"AllMonitors", 1, g_ini.c_str()) != 0;
     GetPrivateProfileStringW(L"Taskbar", L"TintColor", L"", b, 32, g_ini.c_str());
     V(iTint) = b[0] == L'#' ? double(wcstoul(b + 1, nullptr, 16) & 0xFFFFFF) : kDefTint;
     GetPrivateProfileStringW(L"Taskbar", L"TintOpacity", L"", b, 32, g_ini.c_str());
@@ -285,17 +317,22 @@ void Layout() {
     g_pane = RectF(S(m), S(top), S(kWinW - 2 * m), S(kWinH - top - 20));
     auto box = [&](int i, float X, float Y, float W, float H) { g_items[i].box = RectF(S(X), S(Y), S(W), S(H)); };
     box(iEnabled, kWinW - m - 20 - 130, top + 8, 130, 40);
-    float tw = (w - 3 * 8) / 4;
-    for (int k = 0; k < 4; k++) box(iClear + k, x + k * (tw + 8), 120, tw, 32);
+    float tw = (w - 4 * 8) / 5;
+    for (int k = 0; k < 5; k++) box(iClear + k, x + k * (tw + 8), 120, tw, 32);
     box(iTint, x, 164, w, 40);
     box(iDensity, x, 212, w, 44);
     float t1 = std::ceil(TextW(Tr(g_items[iAutostart].label), 13)) + 16 + 40;
     float t2 = std::ceil(TextW(Tr(g_items[iTray].label), 13)) + 16 + 40;
     box(iAutostart, x, 284, t1, 40);
     box(iTray, x + t1 + 32, 284, t2, 40);
-    box(iLang, x, 332, 120, 32);
-    box(iReset, x + 128, 332, 120, 32);
-    g_items[iTint].enabled = g_items[iDensity].enabled = g_mode != 0;
+    float t3 = std::ceil(TextW(Tr(g_items[iMaxSolid].label), 13)) + 16 + 40;
+    float t4 = std::ceil(TextW(Tr(g_items[iAllMon].label), 13)) + 16 + 40;
+    box(iMaxSolid, x, 328, t3, 40);
+    box(iAllMon, x + t3 + 32, 328, t4, 40);
+    box(iLang, x, 376, 120, 32);
+    box(iReset, x + 128, 376, 120, 32);
+    g_items[iTint].enabled = g_mode != 0;
+    g_items[iDensity].enabled = g_mode != 0 && g_mode != 4;
 }
 
 RectF Track(const Item& it) { return RectF(it.box.X, it.box.Y + S(30), it.box.Width, S(4)); }
@@ -413,6 +450,8 @@ void Activate(HWND w, int i) {
         g_mode = kDefMode;
         V(iTint) = kDefTint;
         V(iDensity) = kDefDensity;
+        V(iMaxSolid) = 0;
+        V(iAllMon) = 1;
         Reapply();
         SetTimer(w, kSave, 200, nullptr);
         InvalidateRect(w, nullptr, FALSE);
@@ -559,6 +598,7 @@ LRESULT CALLBACK TrayProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_DESTROY:
         if (g_win) DestroyWindow(g_win);
         KillTimer(h, kReapply);
+        V(iEnabled) = 0;
         g_state = 0; g_color = 0;
         Push();
         RemoveTray();
