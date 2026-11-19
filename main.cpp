@@ -8,6 +8,7 @@ namespace Gdiplus { using std::min; using std::max; }
 #include <gdiplus.h>
 #include <shellapi.h>
 #include <shlwapi.h>
+#include <shellscalingapi.h>
 #include <urlmon.h>
 #include <wininet.h>
 #include <cmath>
@@ -26,6 +27,7 @@ namespace Gdiplus { using std::min; using std::max; }
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "shlwapi.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "shcore.lib")
 #pragma comment(lib, "urlmon.lib")
 #pragma comment(lib, "wininet.lib")
 using namespace Gdiplus;
@@ -36,7 +38,7 @@ using SetWcaFn = BOOL(WINAPI*)(HWND, WcaData*);
 using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
 
 constexpr wchar_t kName[] = L"OpalBar";
-constexpr wchar_t kVersion[] = L"0.4.0";
+constexpr wchar_t kVersion[] = L"0.4.1";
 constexpr wchar_t kTrayClass[] = L"OpalBar10Tray";
 constexpr wchar_t kSettingsClass[] = L"OpalBar10Settings";
 constexpr wchar_t kMutex[] = L"OpalBar10.single";
@@ -71,7 +73,7 @@ static std::vector<Item> g_items = {
     { kSlider, L"Tint density", 0, 1, 0.01, kDefDensity },
     { kToggle, L"Start with Windows", 0, 1, 1, 0 },
     { kToggle, L"Tray icon", 0, 1, 1, 1 },
-    { kToggle, L"Solid when a window is maximized", 0, 1, 1, 0 },
+    { kToggle, L"Solid when maximized", 0, 1, 1, 0 },
     { kToggle, L"All monitors", 0, 1, 1, 1 },
     { kButton, L"Русский", 0, 0, 0, 0 },
     { kButton, L"Reset", 0, 0, 0, 0 },
@@ -85,7 +87,7 @@ static const wchar_t* kRu[][2] = {
     { L"Tint color", L"Цвет тонировки" }, { L"Tint density", L"Плотность тонировки" },
     { L"Start with Windows", L"Запускать с Windows" }, { L"Tray icon", L"Значок в трее" },
     { L"Reset", L"Сброс" }, { L"OpalBar Settings", L"Настройки OpalBar" },
-    { L"Solid", L"Сплошной" }, { L"Solid when a window is maximized", L"Сплошной при развёрнутом окне" },
+    { L"Solid", L"Сплошной" }, { L"Solid when maximized", L"Сплошной при развёрнутом" },
     { L"All monitors", L"Все мониторы" },
     { L"Check for updates", L"Проверить обновления" }, { L"Checking…", L"Проверяю…" },
     { L"You have the latest version", L"Установлена последняя версия" },
@@ -103,7 +105,7 @@ bool g_ru;
 int g_mode = kDefMode;
 int g_state;
 unsigned g_color, g_solid;
-float g_s = 1;
+float g_s = 1, g_fit = 1;
 int g_hover = -1, g_drag = -1;
 std::wstring g_ini;
 std::unique_ptr<Bitmap> g_logo;
@@ -345,7 +347,7 @@ void Layout() {
     float t3 = std::ceil(TextW(Tr(g_items[iMaxSolid].label), 13)) + 16 + 40;
     float t4 = std::ceil(TextW(Tr(g_items[iAllMon].label), 13)) + 16 + 40;
     box(iMaxSolid, x, 328, t3, 40);
-    box(iAllMon, x + t3 + 32, 328, t4, 40);
+    box(iAllMon, x + w - t4, 328, t4, 40);
     box(iLang, x, 376, 120, 32);
     box(iReset, x + 128, 376, 120, 32);
     box(iUpdate, x + w - 216, 376, 216, 32);
@@ -671,7 +673,7 @@ LRESULT CALLBACK SettingsProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         else if (!ApplyUpdate()) SetUpdate(w, L"Could not install the update");
         return 0;
     case WM_DPICHANGED: {
-        g_s = HIWORD(wp) / 96.f;
+        g_s = HIWORD(wp) / 96.f * g_fit;
         auto r = (RECT*)lp;
         SetWindowPos(w, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
         InvalidateRect(w, nullptr, FALSE);
@@ -697,16 +699,26 @@ void OpenSettings() {
     wc.lpszClassName = kSettingsClass;
     RegisterClassW(&wc);
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    UINT dpi = GetDpiForSystem();
+    POINT cp; GetCursorPos(&cp);
+    HMONITOR mon = MonitorFromPoint(cp, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{ sizeof mi };
+    GetMonitorInfoW(mon, &mi);
+    RECT wa = mi.rcWork;
+    UINT dpi = 96, dpiY = 96;
+    if (FAILED(GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dpi, &dpiY))) dpi = GetDpiForSystem();
+    g_fit = 1;
     g_s = dpi / 96.f;
     RECT r{ 0, 0, (LONG)S(kWinW), (LONG)S(kWinH) };
     AdjustWindowRectExForDpi(&r, style, FALSE, 0, dpi);
-    RECT wa;
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    g_fit = std::min({ 1.f, float(wa.bottom - wa.top) / (r.bottom - r.top), float(wa.right - wa.left) / (r.right - r.left) });
+    g_s *= g_fit;
+    r = { 0, 0, (LONG)S(kWinW), (LONG)S(kWinH) };
+    AdjustWindowRectExForDpi(&r, style, FALSE, 0, dpi);
     g_win = CreateWindowExW(0, kSettingsClass, Tr(L"OpalBar Settings"), style, wa.left + (wa.right - wa.left - (r.right - r.left)) / 2,
                             wa.top + (wa.bottom - wa.top - (r.bottom - r.top)) / 2, r.right - r.left, r.bottom - r.top, nullptr, nullptr, inst, nullptr);
     if (!g_win) { Log("settings window failed err=%lu", GetLastError()); return; }
-    g_s = GetDpiForWindow(g_win) / 96.f;
+    g_s = GetDpiForWindow(g_win) / 96.f * g_fit;
+    Log("settings dpi=%u fit=%.2f work=%ldx%ld window=%ldx%ld", dpi, g_fit, wa.right - wa.left, wa.bottom - wa.top, r.right - r.left, r.bottom - r.top);
     BOOL dark = TRUE;
     DwmSetWindowAttribute(g_win, 20, &dark, sizeof(dark));
     ShowWindow(g_win, SW_SHOW);
